@@ -18,6 +18,11 @@ import (
 // happens after all other systems in the update
 const RenderSystemPriority = -1000
 
+// maxFramesInFlight is the number of frames allowed to be in-flight. Places an
+// upper-bound on the amount of frames drawn between draw calls
+const maxFramesInFlight = 2
+
+// RenderComponent is the component used by the RenderSystem
 type RenderComponent struct {
 	// Hidden is used to prevent drawing by OpenGL
 	Hidden bool
@@ -38,27 +43,29 @@ type renderEntity struct {
 }
 
 type RenderSystem struct {
-	entities                []renderEntity
-	instance                vk.Instance
-	surface                 vk.Surface
-	device                  vk.Device
-	graphicsIdx             uint32
-	graphicsQueue           vk.Queue
-	presentIdx              uint32
-	presentQueue            vk.Queue
-	swapChain               vk.Swapchain
-	images                  []vk.Image
-	swapChainImageFormat    vk.Format
-	swapChainExtent         vk.Extent2D
-	swapChainImageViews     []vk.ImageView
-	renderPass              vk.RenderPass
-	pipelineLayout          vk.PipelineLayout
-	graphicsPipelines       []vk.Pipeline
-	swapChainFramebuffers   []vk.Framebuffer
-	commandPool             vk.CommandPool
-	commandBuffers          []vk.CommandBuffer
-	imageAvailableSemaphore vk.Semaphore
-	renderFinishedSemaphore vk.Semaphore
+	entities                 []renderEntity
+	instance                 vk.Instance
+	surface                  vk.Surface
+	device                   vk.Device
+	graphicsIdx              uint32
+	graphicsQueue            vk.Queue
+	presentIdx               uint32
+	presentQueue             vk.Queue
+	swapChain                vk.Swapchain
+	images                   []vk.Image
+	swapChainImageFormat     vk.Format
+	swapChainExtent          vk.Extent2D
+	swapChainImageViews      []vk.ImageView
+	renderPass               vk.RenderPass
+	pipelineLayout           vk.PipelineLayout
+	graphicsPipelines        []vk.Pipeline
+	swapChainFramebuffers    []vk.Framebuffer
+	commandPool              vk.CommandPool
+	commandBuffers           []vk.CommandBuffer
+	imageAvailableSemaphores []vk.Semaphore
+	renderFinishedSemaphores []vk.Semaphore
+	inFlightFences           []vk.Fence
+	currentFrame             int
 }
 
 func (r *RenderSystem) New(w *ecs.World) {
@@ -86,17 +93,19 @@ func (r *RenderSystem) New(w *ecs.World) {
 	if err := r.createCommandBuffers(); err != nil {
 		panic(err)
 	}
-	if err := r.createSemaphores(); err != nil {
+	if err := r.createSyncObjects(); err != nil {
 		panic(err)
 	}
 }
 
 func (r *RenderSystem) Update(dt float32) {
 	var imageIndex uint32
-	vk.AcquireNextImage(r.device, r.swapChain, math.MaxUint64, r.imageAvailableSemaphore, vk.NullFence, &imageIndex)
-	waitSemaphores := []vk.Semaphore{r.imageAvailableSemaphore}
+	vk.WaitForFences(r.device, 1, r.inFlightFences[r.currentFrame:r.currentFrame], vk.True, math.MaxUint64)
+	vk.ResetFences(r.device, 1, r.inFlightFences[r.currentFrame:r.currentFrame])
+	vk.AcquireNextImage(r.device, r.swapChain, math.MaxUint64, r.imageAvailableSemaphores[r.currentFrame], vk.NullFence, &imageIndex)
+	waitSemaphores := []vk.Semaphore{r.imageAvailableSemaphores[r.currentFrame]}
 	waitStages := []vk.PipelineStageFlags{vk.PipelineStageFlags(vk.PipelineStageColorAttachmentOutputBit)}
-	signalSemaphores := []vk.Semaphore{r.renderFinishedSemaphore}
+	signalSemaphores := []vk.Semaphore{r.renderFinishedSemaphores[r.currentFrame]}
 	submitInfo := []vk.SubmitInfo{vk.SubmitInfo{
 		SType:                vk.StructureTypeSubmitInfo,
 		WaitSemaphoreCount:   1,
@@ -107,7 +116,7 @@ func (r *RenderSystem) Update(dt float32) {
 		SignalSemaphoreCount: 1,
 		PSignalSemaphores:    signalSemaphores,
 	}}
-	if vk.QueueSubmit(r.graphicsQueue, 1, submitInfo, vk.NullFence) != vk.Success {
+	if vk.QueueSubmit(r.graphicsQueue, 1, submitInfo, r.inFlightFences[r.currentFrame]) != vk.Success {
 		panic("failed to submit draw command buffer!")
 	}
 	presentInfo := vk.PresentInfo{
@@ -121,7 +130,8 @@ func (r *RenderSystem) Update(dt float32) {
 	if vk.QueuePresent(r.presentQueue, &presentInfo) != vk.Success {
 		panic("failed to present draw")
 	}
-	vk.DeviceWaitIdle(r.device)
+	r.currentFrame++
+	r.currentFrame %= maxFramesInFlight
 }
 
 func (r *RenderSystem) Remove(e ecs.BasicEntity) {}
@@ -677,22 +687,39 @@ func (r *RenderSystem) createCommandBuffers() error {
 	return nil
 }
 
-func (r *RenderSystem) createSemaphores() error {
+func (r *RenderSystem) createSyncObjects() error {
+	r.imageAvailableSemaphores = make([]vk.Semaphore, maxFramesInFlight)
+	r.renderFinishedSemaphores = make([]vk.Semaphore, maxFramesInFlight)
+	r.inFlightFences = make([]vk.Fence, maxFramesInFlight)
+
 	semaphoreInfo := vk.SemaphoreCreateInfo{
 		SType: vk.StructureTypeSemaphoreCreateInfo,
 	}
 
-	var imageAvailableSemaphore vk.Semaphore
-	if vk.CreateSemaphore(r.device, &semaphoreInfo, nil, &imageAvailableSemaphore) != vk.Success {
-		return errors.New("failed to create image semaphore")
+	fenceInfo := vk.FenceCreateInfo{
+		SType: vk.StructureTypeFenceCreateInfo,
+		Flags: vk.FenceCreateFlags(vk.FenceCreateSignaledBit),
 	}
-	r.imageAvailableSemaphore = imageAvailableSemaphore
 
-	var renderFinishedSemaphore vk.Semaphore
-	if vk.CreateSemaphore(r.device, &semaphoreInfo, nil, &renderFinishedSemaphore) != vk.Success {
-		return errors.New("failed to create render finished semaphore")
+	for i := 0; i < maxFramesInFlight; i++ {
+		var imageAvailableSemaphore vk.Semaphore
+		if vk.CreateSemaphore(r.device, &semaphoreInfo, nil, &imageAvailableSemaphore) != vk.Success {
+			return errors.New("failed to create image semaphore")
+		}
+		r.imageAvailableSemaphores[i] = imageAvailableSemaphore
+
+		var renderFinishedSemaphore vk.Semaphore
+		if vk.CreateSemaphore(r.device, &semaphoreInfo, nil, &renderFinishedSemaphore) != vk.Success {
+			return errors.New("failed to create render finished semaphore")
+		}
+		r.renderFinishedSemaphores[i] = renderFinishedSemaphore
+
+		var fence vk.Fence
+		if vk.CreateFence(r.device, &fenceInfo, nil, &fence) != vk.Success {
+			return errors.New("failed to create fence")
+		}
+		r.inFlightFences[i] = fence
 	}
-	r.renderFinishedSemaphore = renderFinishedSemaphore
 
 	return nil
 }
