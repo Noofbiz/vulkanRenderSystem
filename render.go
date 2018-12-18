@@ -3,7 +3,8 @@ package vulkanRenderSystem
 import (
 	"errors"
 	"image/color"
-	"math"
+	"sync"
+	"unsafe"
 
 	"engo.io/ecs"
 	"engo.io/engo"
@@ -46,6 +47,7 @@ type RenderSystem struct {
 	entities                 []renderEntity
 	instance                 vk.Instance
 	surface                  vk.Surface
+	gpu                      vk.PhysicalDevice
 	device                   vk.Device
 	graphicsIdx              uint32
 	graphicsQueue            vk.Queue
@@ -66,9 +68,22 @@ type RenderSystem struct {
 	renderFinishedSemaphores []vk.Semaphore
 	inFlightFences           []vk.Fence
 	currentFrame             int
+	framebufferResized       bool
+	lock                     sync.Mutex
+	vertexBuffer             vk.Buffer
+	vertexBufferMemory       vk.DeviceMemory
 }
 
 func (r *RenderSystem) New(w *ecs.World) {
+	engo.Mailbox.Listen("WindowResizeMessage", func(m engo.Message) {
+		_, ok := m.(engo.WindowResizeMessage)
+		if !ok {
+			return
+		}
+		r.lock.Lock()
+		r.framebufferResized = true
+		r.lock.Unlock()
+	})
 	if err := r.initVulkan(); err != nil {
 		panic(err)
 	}
@@ -90,6 +105,9 @@ func (r *RenderSystem) New(w *ecs.World) {
 	if err := r.createCommandPool(); err != nil {
 		panic(err)
 	}
+	if err := r.createVertexBuffer(); err != nil {
+		panic(err)
+	}
 	if err := r.createCommandBuffers(); err != nil {
 		panic(err)
 	}
@@ -100,9 +118,18 @@ func (r *RenderSystem) New(w *ecs.World) {
 
 func (r *RenderSystem) Update(dt float32) {
 	var imageIndex uint32
-	vk.WaitForFences(r.device, 1, r.inFlightFences[r.currentFrame:r.currentFrame], vk.True, math.MaxUint64)
-	vk.ResetFences(r.device, 1, r.inFlightFences[r.currentFrame:r.currentFrame])
-	vk.AcquireNextImage(r.device, r.swapChain, math.MaxUint64, r.imageAvailableSemaphores[r.currentFrame], vk.NullFence, &imageIndex)
+	r.lock.Lock()
+	if r.framebufferResized {
+		r.recreateSwapChain()
+		r.framebufferResized = false
+		r.lock.Unlock()
+		return
+	}
+	r.lock.Unlock()
+	vk.WaitForFences(r.device, 1, r.inFlightFences[r.currentFrame:r.currentFrame], vk.True, vk.MaxUint64)
+	if res := vk.AcquireNextImage(r.device, r.swapChain, vk.MaxUint64, r.imageAvailableSemaphores[r.currentFrame], vk.NullFence, &imageIndex); res != vk.Success {
+		panic("failed to aquire swap chain image")
+	}
 	waitSemaphores := []vk.Semaphore{r.imageAvailableSemaphores[r.currentFrame]}
 	waitStages := []vk.PipelineStageFlags{vk.PipelineStageFlags(vk.PipelineStageColorAttachmentOutputBit)}
 	signalSemaphores := []vk.Semaphore{r.renderFinishedSemaphores[r.currentFrame]}
@@ -116,6 +143,7 @@ func (r *RenderSystem) Update(dt float32) {
 		SignalSemaphoreCount: 1,
 		PSignalSemaphores:    signalSemaphores,
 	}}
+	vk.ResetFences(r.device, 1, r.inFlightFences[r.currentFrame:r.currentFrame])
 	if vk.QueueSubmit(r.graphicsQueue, 1, submitInfo, r.inFlightFences[r.currentFrame]) != vk.Success {
 		panic("failed to submit draw command buffer!")
 	}
@@ -127,7 +155,7 @@ func (r *RenderSystem) Update(dt float32) {
 		PSwapchains:        []vk.Swapchain{r.swapChain},
 		PImageIndices:      []uint32{imageIndex},
 	}
-	if vk.QueuePresent(r.presentQueue, &presentInfo) != vk.Success {
+	if res := vk.QueuePresent(r.presentQueue, &presentInfo); res != vk.Success {
 		panic("failed to present draw")
 	}
 	r.currentFrame++
@@ -139,7 +167,7 @@ func (r *RenderSystem) Remove(e ecs.BasicEntity) {}
 func (r *RenderSystem) initVulkan() error {
 	appInfo := vk.ApplicationInfo{
 		SType:              vk.StructureTypeApplicationInfo,
-		PApplicationName:   engo.GetTitle(),
+		PApplicationName:   safeString(engo.GetTitle()),
 		ApplicationVersion: vk.MakeVersion(1, 0, 0),
 		PEngineName:        safeString("engo engine"),
 		EngineVersion:      vk.MakeVersion(1, 0, 2),
@@ -240,6 +268,7 @@ deviceLoop:
 		vk.GetPhysicalDeviceSurfacePresentModes(device, r.surface, &presentModeCount, details.presentModes)
 		deviceSelected = true
 		physicalDevice = device
+		r.gpu = device
 	}
 	if !deviceSelected {
 		return errors.New("failed to find a sutible GPU")
@@ -310,9 +339,11 @@ func (r *RenderSystem) createSwapChain() error {
 	createInfo.PresentMode = presentMode
 	createInfo.Clipped = vk.True
 	createInfo.OldSwapchain = vk.Swapchain(vk.NullHandle)
-	if res := vk.CreateSwapchain(r.device, &createInfo, nil, &r.swapChain); res != vk.Success {
+	var swapchain vk.Swapchain
+	if res := vk.CreateSwapchain(r.device, &createInfo, nil, &swapchain); res != vk.Success {
 		return errors.New("failed to create swap chain")
 	}
+	r.swapChain = swapchain
 	var numImgs uint32
 	vk.GetSwapchainImages(r.device, r.swapChain, &numImgs, nil)
 	r.images = make([]vk.Image, numImgs)
@@ -358,12 +389,14 @@ func (r *RenderSystem) chooseSwapPresentMode() vk.PresentMode {
 
 func (r *RenderSystem) chooseSwapExtent() vk.Extent2D {
 	details.capabilities.Deref()
-	if details.capabilities.CurrentExtent.Width != math.MaxUint32 {
+	if details.capabilities.CurrentExtent.Width != vk.MaxUint32 {
 		return details.capabilities.CurrentExtent
 	}
+	w := uint32(engo.CanvasWidth())
+	h := uint32(engo.CanvasHeight())
 	actualExtent := vk.Extent2D{
-		Width:  800,
-		Height: 600,
+		Width:  w,
+		Height: h,
 	}
 	actualExtent.Width = clamp(details.capabilities.MaxImageExtent.Width,
 		details.capabilities.MinImageExtent.Width, actualExtent.Width)
@@ -447,7 +480,6 @@ func (r *RenderSystem) createRenderPass() error {
 }
 
 func (r *RenderSystem) createGraphicsPipeline() error {
-
 	vertShaderData, err := shaders.Asset("vert.spv")
 	if err != nil {
 		return err
@@ -484,8 +516,15 @@ func (r *RenderSystem) createGraphicsPipeline() error {
 		fragShaderStageInfo,
 	}
 
+	a := vertices.getAttributeDescriptions()
+	b := vertices.getBindingDescription()
+
 	vertexInputInfo := vk.PipelineVertexInputStateCreateInfo{
 		SType: vk.StructureTypePipelineVertexInputStateCreateInfo,
+		VertexBindingDescriptionCount:   1,
+		VertexAttributeDescriptionCount: uint32(len(a)),
+		PVertexBindingDescriptions:      []vk.VertexInputBindingDescription{b},
+		PVertexAttributeDescriptions:    a,
 	}
 
 	inputAssembly := vk.PipelineInputAssemblyStateCreateInfo{
@@ -677,7 +716,10 @@ func (r *RenderSystem) createCommandBuffers() error {
 		renderPassInfo.RenderArea.Extent = r.swapChainExtent
 		vk.CmdBeginRenderPass(buffer, &renderPassInfo, vk.SubpassContentsInline)
 		vk.CmdBindPipeline(buffer, vk.PipelineBindPointGraphics, r.graphicsPipelines[0])
-		vk.CmdDraw(buffer, 3, 1, 0, 0)
+		buffers := []vk.Buffer{r.vertexBuffer}
+		offsets := []vk.DeviceSize{0}
+		vk.CmdBindVertexBuffers(buffer, 0, 1, buffers, offsets)
+		vk.CmdDraw(buffer, uint32(len(vertices)/5), 1, 0, 0)
 		vk.CmdEndRenderPass(buffer)
 		if vk.EndCommandBuffer(buffer) != vk.Success {
 			return errors.New("failed to record command buffer!")
@@ -722,4 +764,91 @@ func (r *RenderSystem) createSyncObjects() error {
 	}
 
 	return nil
+}
+
+func (r *RenderSystem) recreateSwapChain() error {
+	vk.DeviceWaitIdle(r.device)
+
+	r.cleanupSwapChain()
+
+	if err := r.createSwapChain(); err != nil {
+		return err
+	}
+	if err := r.createImageViews(); err != nil {
+		return err
+	}
+	if err := r.createRenderPass(); err != nil {
+		return err
+	}
+	if err := r.createGraphicsPipeline(); err != nil {
+		return err
+	}
+	if err := r.createFrameBuffers(); err != nil {
+		return err
+	}
+	if err := r.createCommandBuffers(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (r *RenderSystem) createVertexBuffer() error {
+	bufferCreateInfo := vk.BufferCreateInfo{
+		SType:       vk.StructureTypeBufferCreateInfo,
+		Size:        vk.DeviceSize(4 * uint64(len(vertices))),
+		Usage:       vk.BufferUsageFlags(vk.BufferUsageVertexBufferBit),
+		SharingMode: vk.SharingModeExclusive,
+	}
+	var b vk.Buffer
+	if res := vk.CreateBuffer(r.device, &bufferCreateInfo, nil, &b); res != vk.Success {
+		return errors.New("unable to create vertex buffer")
+	}
+	r.vertexBuffer = b
+
+	memReq := vk.MemoryRequirements{}
+	vk.GetBufferMemoryRequirements(r.device, r.vertexBuffer, &memReq)
+	memReq.Deref()
+
+	memIdx, err := r.findMemoryType(memReq.MemoryTypeBits, vk.MemoryPropertyFlags(vk.MemoryPropertyHostVisibleBit|vk.MemoryPropertyHostCoherentBit))
+	if err != nil {
+		return err
+	}
+	allocInfo := vk.MemoryAllocateInfo{
+		SType:           vk.StructureTypeMemoryAllocateInfo,
+		AllocationSize:  memReq.Size,
+		MemoryTypeIndex: memIdx,
+	}
+	var devMem vk.DeviceMemory
+	if res := vk.AllocateMemory(r.device, &allocInfo, nil, &devMem); res != vk.Success {
+		return errors.New("failed to allocate vertex buffer memory")
+	}
+	r.vertexBufferMemory = devMem
+
+	if res := vk.BindBufferMemory(r.device, r.vertexBuffer, r.vertexBufferMemory, 0); res != vk.Success {
+		return errors.New("unable to bind vertex buffer memory")
+	}
+
+	var data unsafe.Pointer
+	vk.MapMemory(r.device, r.vertexBufferMemory, 0,
+		vk.DeviceSize(4*uint64(len(vertices))), 0, &data)
+	n := vk.Memcopy(data, vertexData(vertices))
+	if n != len(vertices)*4 {
+		return errors.New("failed to copy vertex buffer data")
+	}
+	vk.UnmapMemory(r.device, r.vertexBufferMemory)
+
+	return nil
+}
+
+func (r *RenderSystem) findMemoryType(typeFilter uint32, properties vk.MemoryPropertyFlags) (uint32, error) {
+	memProp := vk.PhysicalDeviceMemoryProperties{}
+	vk.GetPhysicalDeviceMemoryProperties(r.gpu, &memProp)
+	memProp.Deref()
+	for i := uint32(0); i < memProp.MemoryTypeCount; i++ {
+		memProp.MemoryTypes[i].Deref()
+		if typeFilter&(1<<i) != 0 && (memProp.MemoryTypes[i].PropertyFlags&properties) == properties {
+			return i, nil
+		}
+	}
+	return 0, errors.New("failed to find suitable memory type")
 }
