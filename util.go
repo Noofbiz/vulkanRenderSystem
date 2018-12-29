@@ -57,6 +57,11 @@ func vertexData(v vertex) []byte {
 	return (*[m]byte)(unsafe.Pointer((*sliceHeader)(unsafe.Pointer(&v)).Data))[:len(v)*4]
 }
 
+func indexData(v []uint16) []byte {
+	const m = 0x7fffffff
+	return (*[m]byte)(unsafe.Pointer((*sliceHeader)(unsafe.Pointer(&v)).Data))[:len(v)*2]
+}
+
 type sliceHeader struct {
 	Data uintptr
 	Len  int

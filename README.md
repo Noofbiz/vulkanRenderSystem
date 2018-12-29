@@ -17,5 +17,8 @@ installed.
 On OSX make sure you have [MoltenVK](https://github.com/KhronosGroup/MoltenVK)
 installed.
 
-Currently this only works with SDL. Use the build tag sdl to run.
-`go run --tags=sdl *.go`
+### Building with engo
+
+Use the build tag vulkan from `engo` to run.
+
+`go run --tags=vulkan *.go`

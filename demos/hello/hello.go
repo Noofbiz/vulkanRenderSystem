@@ -33,10 +33,12 @@ func (d *DefaultScene) Exit() {
 
 func main() {
 	opts := engo.RunOptions{
-		Title:     "Hello World Demo",
-		Width:     1024,
-		Height:    640,
-		UseVulkan: true,
+		Title:                      "Hello World Demo",
+		Width:                      1024,
+		Height:                     640,
+		ApplicationMajorVersion:    1,
+		ApplicationMinorVersion:    0,
+		ApplicationRevisionVersion: 0,
 	}
 	engo.Run(opts, &DefaultScene{})
 }

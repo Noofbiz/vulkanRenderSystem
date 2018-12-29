@@ -72,6 +72,8 @@ type RenderSystem struct {
 	lock                     sync.Mutex
 	vertexBuffer             vk.Buffer
 	vertexBufferMemory       vk.DeviceMemory
+	indexBuffer              vk.Buffer
+	indexBufferMemory        vk.DeviceMemory
 }
 
 func (r *RenderSystem) New(w *ecs.World) {
@@ -106,6 +108,9 @@ func (r *RenderSystem) New(w *ecs.World) {
 		panic(err)
 	}
 	if err := r.createVertexBuffer(); err != nil {
+		panic(err)
+	}
+	if err := r.createIndexBuffer(); err != nil {
 		panic(err)
 	}
 	if err := r.createCommandBuffers(); err != nil {
@@ -165,10 +170,11 @@ func (r *RenderSystem) Update(dt float32) {
 func (r *RenderSystem) Remove(e ecs.BasicEntity) {}
 
 func (r *RenderSystem) initVulkan() error {
+	version := engo.GetApplicationVersion()
 	appInfo := vk.ApplicationInfo{
 		SType:              vk.StructureTypeApplicationInfo,
 		PApplicationName:   safeString(engo.GetTitle()),
-		ApplicationVersion: vk.MakeVersion(1, 0, 0),
+		ApplicationVersion: vk.MakeVersion(version[0], version[1], version[2]),
 		PEngineName:        safeString("engo engine"),
 		EngineVersion:      vk.MakeVersion(1, 0, 2),
 		ApiVersion:         vk.ApiVersion10,
@@ -179,7 +185,7 @@ func (r *RenderSystem) initVulkan() error {
 	createInfo := vk.InstanceCreateInfo{}
 	createInfo.SType = vk.StructureTypeInstanceCreateInfo
 	createInfo.PApplicationInfo = &appInfo
-	exts := engo.Window.VulkanGetInstanceExtensions()
+	exts := engo.Window.GetRequiredInstanceExtensions()
 	createInfo.EnabledExtensionCount = uint32(len(exts))
 	createInfo.PpEnabledExtensionNames = exts
 	if res := vk.CreateInstance(&createInfo, nil, &r.instance); res != vk.Success {
@@ -188,7 +194,7 @@ func (r *RenderSystem) initVulkan() error {
 	if err := vk.InitInstance(r.instance); err != nil {
 		return err
 	}
-	surfPtr, err := engo.Window.VulkanCreateSurface(r.instance)
+	surfPtr, err := engo.Window.CreateWindowSurface(r.instance, nil)
 	r.surface = vk.SurfaceFromPointer(surfPtr)
 	if err != nil {
 		return err
@@ -520,7 +526,7 @@ func (r *RenderSystem) createGraphicsPipeline() error {
 	b := vertices.getBindingDescription()
 
 	vertexInputInfo := vk.PipelineVertexInputStateCreateInfo{
-		SType: vk.StructureTypePipelineVertexInputStateCreateInfo,
+		SType:                           vk.StructureTypePipelineVertexInputStateCreateInfo,
 		VertexBindingDescriptionCount:   1,
 		VertexAttributeDescriptionCount: uint32(len(a)),
 		PVertexBindingDescriptions:      []vk.VertexInputBindingDescription{b},
@@ -719,7 +725,9 @@ func (r *RenderSystem) createCommandBuffers() error {
 		buffers := []vk.Buffer{r.vertexBuffer}
 		offsets := []vk.DeviceSize{0}
 		vk.CmdBindVertexBuffers(buffer, 0, 1, buffers, offsets)
-		vk.CmdDraw(buffer, uint32(len(vertices)/5), 1, 0, 0)
+		vk.CmdBindIndexBuffer(buffer, r.indexBuffer, 0, vk.IndexTypeUint16)
+		//vk.CmdDraw(buffer, uint32(len(vertices)/5), 1, 0, 0)
+		vk.CmdDrawIndexed(buffer, uint32(len(indices)), 1, 0, 0, 0)
 		vk.CmdEndRenderPass(buffer)
 		if vk.EndCommandBuffer(buffer) != vk.Success {
 			return errors.New("failed to record command buffer!")
@@ -793,49 +801,30 @@ func (r *RenderSystem) recreateSwapChain() error {
 }
 
 func (r *RenderSystem) createVertexBuffer() error {
-	bufferCreateInfo := vk.BufferCreateInfo{
-		SType:       vk.StructureTypeBufferCreateInfo,
-		Size:        vk.DeviceSize(4 * uint64(len(vertices))),
-		Usage:       vk.BufferUsageFlags(vk.BufferUsageVertexBufferBit),
-		SharingMode: vk.SharingModeExclusive,
-	}
-	var b vk.Buffer
-	if res := vk.CreateBuffer(r.device, &bufferCreateInfo, nil, &b); res != vk.Success {
-		return errors.New("unable to create vertex buffer")
-	}
-	r.vertexBuffer = b
-
-	memReq := vk.MemoryRequirements{}
-	vk.GetBufferMemoryRequirements(r.device, r.vertexBuffer, &memReq)
-	memReq.Deref()
-
-	memIdx, err := r.findMemoryType(memReq.MemoryTypeBits, vk.MemoryPropertyFlags(vk.MemoryPropertyHostVisibleBit|vk.MemoryPropertyHostCoherentBit))
+	var err error
+	bufferSize := vk.DeviceSize(4 * uint64(len(vertices)))
+	stagingBuffer, stagingBufferMemory, err := r.createBuffer(bufferSize, vk.BufferUsageFlags(vk.BufferUsageTransferSrcBit), vk.MemoryPropertyFlags(vk.MemoryPropertyHostVisibleBit|vk.MemoryPropertyHostCoherentBit))
 	if err != nil {
 		return err
 	}
-	allocInfo := vk.MemoryAllocateInfo{
-		SType:           vk.StructureTypeMemoryAllocateInfo,
-		AllocationSize:  memReq.Size,
-		MemoryTypeIndex: memIdx,
-	}
-	var devMem vk.DeviceMemory
-	if res := vk.AllocateMemory(r.device, &allocInfo, nil, &devMem); res != vk.Success {
-		return errors.New("failed to allocate vertex buffer memory")
-	}
-	r.vertexBufferMemory = devMem
-
-	if res := vk.BindBufferMemory(r.device, r.vertexBuffer, r.vertexBufferMemory, 0); res != vk.Success {
-		return errors.New("unable to bind vertex buffer memory")
-	}
 
 	var data unsafe.Pointer
-	vk.MapMemory(r.device, r.vertexBufferMemory, 0,
-		vk.DeviceSize(4*uint64(len(vertices))), 0, &data)
+	vk.MapMemory(r.device, stagingBufferMemory, 0, bufferSize, 0, &data)
 	n := vk.Memcopy(data, vertexData(vertices))
 	if n != len(vertices)*4 {
 		return errors.New("failed to copy vertex buffer data")
 	}
-	vk.UnmapMemory(r.device, r.vertexBufferMemory)
+	vk.UnmapMemory(r.device, stagingBufferMemory)
+
+	r.vertexBuffer, r.vertexBufferMemory, err = r.createBuffer(bufferSize, vk.BufferUsageFlags(vk.BufferUsageTransferDstBit|vk.BufferUsageVertexBufferBit), vk.MemoryPropertyFlags(vk.MemoryPropertyDeviceLocalBit))
+	if err != nil {
+		return err
+	}
+
+	r.copyBuffer(stagingBuffer, r.vertexBuffer, bufferSize)
+
+	vk.DestroyBuffer(r.device, stagingBuffer, nil)
+	vk.FreeMemory(r.device, stagingBufferMemory, nil)
 
 	return nil
 }
@@ -851,4 +840,119 @@ func (r *RenderSystem) findMemoryType(typeFilter uint32, properties vk.MemoryPro
 		}
 	}
 	return 0, errors.New("failed to find suitable memory type")
+}
+
+func (r *RenderSystem) createBuffer(size vk.DeviceSize, usage vk.BufferUsageFlags, properties vk.MemoryPropertyFlags) (buffer vk.Buffer, bufferMemory vk.DeviceMemory, err error) {
+	bufferCreateInfo := vk.BufferCreateInfo{
+		SType:       vk.StructureTypeBufferCreateInfo,
+		Size:        size,
+		Usage:       usage,
+		SharingMode: vk.SharingModeExclusive,
+	}
+	if res := vk.CreateBuffer(r.device, &bufferCreateInfo, nil, &buffer); res != vk.Success {
+		err = errors.New("unable to create buffer")
+		return
+	}
+
+	memReq := vk.MemoryRequirements{}
+	vk.GetBufferMemoryRequirements(r.device, buffer, &memReq)
+	memReq.Deref()
+
+	memIdx, err := r.findMemoryType(memReq.MemoryTypeBits, properties)
+	if err != nil {
+		return
+	}
+	allocInfo := vk.MemoryAllocateInfo{
+		SType:           vk.StructureTypeMemoryAllocateInfo,
+		AllocationSize:  memReq.Size,
+		MemoryTypeIndex: memIdx,
+	}
+	if res := vk.AllocateMemory(r.device, &allocInfo, nil, &bufferMemory); res != vk.Success {
+		err = errors.New("failed to allocate buffer memory")
+		return
+	}
+
+	if res := vk.BindBufferMemory(r.device, buffer, bufferMemory, 0); res != vk.Success {
+		err = errors.New("unable to bind buffer memory")
+		return
+	}
+
+	return
+}
+
+func (r *RenderSystem) copyBuffer(src, dst vk.Buffer, size vk.DeviceSize) error {
+	allocInfo := vk.CommandBufferAllocateInfo{
+		SType:              vk.StructureTypeCommandBufferAllocateInfo,
+		Level:              vk.CommandBufferLevelPrimary,
+		CommandPool:        r.commandPool,
+		CommandBufferCount: 1,
+	}
+	var commandBuf vk.CommandBuffer
+	commandBufs := []vk.CommandBuffer{commandBuf}
+	if res := vk.AllocateCommandBuffers(r.device, &allocInfo, commandBufs); res != vk.Success {
+		return errors.New("unable to allocate command buffer at copy buffer")
+	}
+
+	beginInfo := vk.CommandBufferBeginInfo{
+		SType: vk.StructureTypeCommandBufferBeginInfo,
+		Flags: vk.CommandBufferUsageFlags(vk.CommandBufferUsageOneTimeSubmitBit),
+	}
+	if res := vk.BeginCommandBuffer(commandBufs[0], &beginInfo); res != vk.Success {
+		return errors.New("unable to begin command buffer at copy buffer")
+	}
+
+	copyRegion := []vk.BufferCopy{vk.BufferCopy{
+		SrcOffset: 0,
+		DstOffset: 0,
+		Size:      size,
+	}}
+	vk.CmdCopyBuffer(commandBufs[0], src, dst, 1, copyRegion)
+
+	if res := vk.EndCommandBuffer(commandBufs[0]); res != vk.Success {
+		return errors.New("unable to end command buffer")
+	}
+
+	submitInfo := vk.SubmitInfo{
+		SType:              vk.StructureTypeSubmitInfo,
+		CommandBufferCount: 1,
+		PCommandBuffers:    commandBufs,
+	}
+
+	if res := vk.QueueSubmit(r.graphicsQueue, 1, []vk.SubmitInfo{submitInfo}, vk.NullFence); res != vk.Success {
+		return errors.New("unable to submit command to queue at copy buffer")
+	}
+	vk.QueueWaitIdle(r.graphicsQueue)
+
+	vk.FreeCommandBuffers(r.device, r.commandPool, 1, commandBufs)
+
+	return nil
+}
+
+func (r *RenderSystem) createIndexBuffer() error {
+	var err error
+	bufferSize := vk.DeviceSize(2 * uint64(len(indices)))
+	stagingBuffer, stagingBufferMemory, err := r.createBuffer(bufferSize, vk.BufferUsageFlags(vk.BufferUsageTransferSrcBit), vk.MemoryPropertyFlags(vk.MemoryPropertyHostVisibleBit|vk.MemoryPropertyHostCoherentBit))
+	if err != nil {
+		return err
+	}
+
+	var data unsafe.Pointer
+	vk.MapMemory(r.device, stagingBufferMemory, 0, bufferSize, 0, &data)
+	n := vk.Memcopy(data, indexData(indices))
+	if n != len(indices)*2 {
+		return errors.New("failed to copy index buffer data")
+	}
+	vk.UnmapMemory(r.device, stagingBufferMemory)
+
+	r.indexBuffer, r.indexBufferMemory, err = r.createBuffer(bufferSize, vk.BufferUsageFlags(vk.BufferUsageTransferDstBit|vk.BufferUsageIndexBufferBit), vk.MemoryPropertyFlags(vk.MemoryPropertyDeviceLocalBit))
+	if err != nil {
+		return err
+	}
+
+	r.copyBuffer(stagingBuffer, r.indexBuffer, bufferSize)
+
+	vk.DestroyBuffer(r.device, stagingBuffer, nil)
+	vk.FreeMemory(r.device, stagingBufferMemory, nil)
+
+	return nil
 }

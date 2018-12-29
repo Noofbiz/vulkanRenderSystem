@@ -8,6 +8,8 @@ import (
 func (r *RenderSystem) Cleanup() {
 	vk.DeviceWaitIdle(r.device)
 	r.cleanupSwapChain()
+	vk.DestroyBuffer(r.device, r.indexBuffer, nil)
+	vk.FreeMemory(r.device, r.indexBufferMemory, nil)
 	vk.DestroyBuffer(r.device, r.vertexBuffer, nil)
 	vk.FreeMemory(r.device, r.vertexBufferMemory, nil)
 	for i := 0; i < maxFramesInFlight; i++ {
