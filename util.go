@@ -62,6 +62,17 @@ func indexData(v []uint16) []byte {
 	return (*[m]byte)(unsafe.Pointer((*sliceHeader)(unsafe.Pointer(&v)).Data))[:len(v)*2]
 }
 
+func uniformData(v UniformBufferObject) []byte {
+	const m = 0x7fffffff
+	exp := make([]float32, 3*16)
+	for i := 0; i < 16; i++ {
+		exp[i] = v.model[i]
+		exp[i+16] = v.view[i]
+		exp[i+32] = v.projection[i]
+	}
+	return (*[m]byte)(unsafe.Pointer((*sliceHeader)(unsafe.Pointer(&exp)).Data))[:3*16*4]
+}
+
 type sliceHeader struct {
 	Data uintptr
 	Len  int

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"image/color"
 	"sync"
+	"time"
 	"unsafe"
 
 	"engo.io/ecs"
@@ -11,6 +12,7 @@ import (
 	"engo.io/systems/physics"
 
 	"github.com/Noofbiz/vulkanRenderSystem/internal/shaders"
+	"github.com/go-gl/mathgl/mgl32"
 
 	vk "github.com/vulkan-go/vulkan"
 )
@@ -74,6 +76,12 @@ type RenderSystem struct {
 	vertexBufferMemory       vk.DeviceMemory
 	indexBuffer              vk.Buffer
 	indexBufferMemory        vk.DeviceMemory
+	descriptorSetLayouts     []vk.DescriptorSetLayout
+	uniformBuffers           []vk.Buffer
+	uniformBuffersMemory     []vk.DeviceMemory
+	startTime                time.Time
+	descriptorPool           vk.DescriptorPool
+	descriptorSets           []vk.DescriptorSet
 }
 
 func (r *RenderSystem) New(w *ecs.World) {
@@ -98,6 +106,9 @@ func (r *RenderSystem) New(w *ecs.World) {
 	if err := r.createRenderPass(); err != nil {
 		panic(err)
 	}
+	if err := r.createDescriptorSetLayout(); err != nil {
+		panic(err)
+	}
 	if err := r.createGraphicsPipeline(); err != nil {
 		panic(err)
 	}
@@ -113,6 +124,15 @@ func (r *RenderSystem) New(w *ecs.World) {
 	if err := r.createIndexBuffer(); err != nil {
 		panic(err)
 	}
+	if err := r.createUniformBuffers(); err != nil {
+		panic(err)
+	}
+	if err := r.createDescriptorPool(); err != nil {
+		panic(err)
+	}
+	if err := r.createDescriptorSets(); err != nil {
+		panic(err)
+	}
 	if err := r.createCommandBuffers(); err != nil {
 		panic(err)
 	}
@@ -122,6 +142,9 @@ func (r *RenderSystem) New(w *ecs.World) {
 }
 
 func (r *RenderSystem) Update(dt float32) {
+	if r.startTime.IsZero() {
+		r.startTime = time.Now()
+	}
 	var imageIndex uint32
 	r.lock.Lock()
 	if r.framebufferResized {
@@ -138,6 +161,7 @@ func (r *RenderSystem) Update(dt float32) {
 	waitSemaphores := []vk.Semaphore{r.imageAvailableSemaphores[r.currentFrame]}
 	waitStages := []vk.PipelineStageFlags{vk.PipelineStageFlags(vk.PipelineStageColorAttachmentOutputBit)}
 	signalSemaphores := []vk.Semaphore{r.renderFinishedSemaphores[r.currentFrame]}
+	r.updateUniformBuffer(imageIndex)
 	submitInfo := []vk.SubmitInfo{vk.SubmitInfo{
 		SType:                vk.StructureTypeSubmitInfo,
 		WaitSemaphoreCount:   1,
@@ -571,7 +595,7 @@ func (r *RenderSystem) createGraphicsPipeline() error {
 		PolygonMode:             vk.PolygonModeFill,
 		LineWidth:               1,
 		CullMode:                vk.CullModeFlags(vk.CullModeBackBit),
-		FrontFace:               vk.FrontFaceClockwise,
+		FrontFace:               vk.FrontFaceCounterClockwise,
 		DepthBiasEnable:         vk.False,
 	}
 
@@ -603,7 +627,9 @@ func (r *RenderSystem) createGraphicsPipeline() error {
 	}
 
 	pipelineLayoutInfo := vk.PipelineLayoutCreateInfo{
-		SType: vk.StructureTypePipelineLayoutCreateInfo,
+		SType:          vk.StructureTypePipelineLayoutCreateInfo,
+		SetLayoutCount: 1,
+		PSetLayouts:    r.descriptorSetLayouts,
 	}
 	var pipelineLayout vk.PipelineLayout
 	if res := vk.CreatePipelineLayout(r.device, &pipelineLayoutInfo, nil, &pipelineLayout); res != vk.Success {
@@ -726,7 +752,7 @@ func (r *RenderSystem) createCommandBuffers() error {
 		offsets := []vk.DeviceSize{0}
 		vk.CmdBindVertexBuffers(buffer, 0, 1, buffers, offsets)
 		vk.CmdBindIndexBuffer(buffer, r.indexBuffer, 0, vk.IndexTypeUint16)
-		//vk.CmdDraw(buffer, uint32(len(vertices)/5), 1, 0, 0)
+		vk.CmdBindDescriptorSets(buffer, vk.PipelineBindPointGraphics, r.pipelineLayout, 0, 1, r.descriptorSets, 0, nil)
 		vk.CmdDrawIndexed(buffer, uint32(len(indices)), 1, 0, 0, 0)
 		vk.CmdEndRenderPass(buffer)
 		if vk.EndCommandBuffer(buffer) != vk.Success {
@@ -954,5 +980,126 @@ func (r *RenderSystem) createIndexBuffer() error {
 	vk.DestroyBuffer(r.device, stagingBuffer, nil)
 	vk.FreeMemory(r.device, stagingBufferMemory, nil)
 
+	return nil
+}
+
+func (r *RenderSystem) createDescriptorSetLayout() error {
+	uboLayoutBinding := vk.DescriptorSetLayoutBinding{
+		Binding:            0,
+		DescriptorType:     vk.DescriptorTypeUniformBuffer,
+		DescriptorCount:    1,
+		StageFlags:         vk.ShaderStageFlags(vk.ShaderStageVertexBit),
+		PImmutableSamplers: []vk.Sampler{vk.NullSampler},
+	}
+	bindings := []vk.DescriptorSetLayoutBinding{uboLayoutBinding}
+
+	layoutInfo := vk.DescriptorSetLayoutCreateInfo{
+		SType:        vk.StructureTypeDescriptorSetLayoutCreateInfo,
+		BindingCount: 1,
+		PBindings:    bindings,
+	}
+
+	var descriptorSetLayout vk.DescriptorSetLayout
+	if res := vk.CreateDescriptorSetLayout(r.device, &layoutInfo, nil, &descriptorSetLayout); res != vk.Success {
+		return errors.New("unable to create descriptor set layout")
+	}
+	r.descriptorSetLayouts = append(r.descriptorSetLayouts, descriptorSetLayout)
+
+	return nil
+}
+
+func (r *RenderSystem) createUniformBuffers() error {
+	bufferSize := vk.DeviceSize(4 * 16 * 3)
+	var err error
+
+	numImages := len(r.images)
+	r.uniformBuffers = make([]vk.Buffer, numImages)
+	r.uniformBuffersMemory = make([]vk.DeviceMemory, numImages)
+
+	for i := 0; i < numImages; i++ {
+		r.uniformBuffers[i], r.uniformBuffersMemory[i], err = r.createBuffer(bufferSize,
+			vk.BufferUsageFlags(vk.BufferUsageUniformBufferBit),
+			vk.MemoryPropertyFlags(vk.MemoryPropertyHostVisibleBit|vk.MemoryPropertyHostCoherentBit))
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (r *RenderSystem) updateUniformBuffer(currentImageIdx uint32) error {
+	elapsed := time.Now().Sub(r.startTime)
+	ubo := UniformBufferObject{
+		model:      mgl32.Ident4(),
+		view:       mgl32.Ident4(),
+		projection: mgl32.Ident4(),
+	}
+	ubo.model = ubo.model.Mul4(mgl32.HomogRotate3DZ(mgl32.DegToRad(90) * float32(elapsed.Seconds())))
+	ubo.view = ubo.view.Mul4(mgl32.LookAt(2, 2, 2, 0, 0, 0, 0, 0, 1))
+	aspect := float32(r.swapChainExtent.Width) / float32(r.swapChainExtent.Height)
+	ubo.projection = ubo.projection.Mul4(mgl32.Perspective(mgl32.DegToRad(45), aspect, 0.1, 10))
+	ubo.projection.Set(1, 1, ubo.projection.At(1, 1)*-1)
+
+	var data unsafe.Pointer
+	bufferSize := vk.DeviceSize(4 * 16 * 3)
+	vk.MapMemory(r.device, r.uniformBuffersMemory[currentImageIdx], 0, bufferSize, 0, &data)
+	n := vk.Memcopy(data, uniformData(ubo))
+	if n != 4*16*3 {
+		return errors.New("failed to copy vertex buffer data")
+	}
+	vk.UnmapMemory(r.device, r.uniformBuffersMemory[currentImageIdx])
+	return nil
+}
+
+func (r *RenderSystem) createDescriptorPool() error {
+	poolSize := vk.DescriptorPoolSize{
+		Type:            vk.DescriptorTypeUniformBuffer,
+		DescriptorCount: uint32(len(r.images)),
+	}
+	poolSizes := []vk.DescriptorPoolSize{poolSize}
+	poolInfo := vk.DescriptorPoolCreateInfo{
+		SType:         vk.StructureTypeDescriptorPoolCreateInfo,
+		PoolSizeCount: 1,
+		PPoolSizes:    poolSizes,
+		MaxSets:       uint32(len(r.images)),
+	}
+	var descriptorPool vk.DescriptorPool
+	if res := vk.CreateDescriptorPool(r.device, &poolInfo, nil, &descriptorPool); res != vk.Success {
+		return errors.New("unable to create descriptor pool")
+	}
+	r.descriptorPool = descriptorPool
+	return nil
+}
+
+func (r *RenderSystem) createDescriptorSets() error {
+	r.descriptorSets = make([]vk.DescriptorSet, len(r.images))
+	for i := range r.images {
+		var set vk.DescriptorSet
+		if ret := vk.AllocateDescriptorSets(r.device, &vk.DescriptorSetAllocateInfo{
+			SType:              vk.StructureTypeDescriptorSetAllocateInfo,
+			DescriptorPool:     r.descriptorPool,
+			DescriptorSetCount: 1,
+			PSetLayouts:        r.descriptorSetLayouts,
+		}, &set); ret != vk.Success {
+			return errors.New("Unable to allocate descriptor set")
+		}
+		r.descriptorSets[i] = set
+		bufferInfo := vk.DescriptorBufferInfo{
+			Buffer: r.uniformBuffers[i],
+			Offset: 0,
+			Range:  vk.DeviceSize(vk.WholeSize),
+		}
+		descriptorWrite := vk.WriteDescriptorSet{
+			SType:           vk.StructureTypeWriteDescriptorSet,
+			DstSet:          r.descriptorSets[i],
+			DstBinding:      0,
+			DstArrayElement: 0,
+			DescriptorType:  vk.DescriptorTypeUniformBuffer,
+			DescriptorCount: 1,
+			PBufferInfo:     []vk.DescriptorBufferInfo{bufferInfo},
+		}
+		vk.UpdateDescriptorSets(r.device, 1, []vk.WriteDescriptorSet{descriptorWrite}, 0, nil)
+	}
 	return nil
 }

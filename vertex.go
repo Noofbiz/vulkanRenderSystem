@@ -2,6 +2,8 @@ package vulkanRenderSystem
 
 import (
 	vk "github.com/vulkan-go/vulkan"
+
+	"github.com/go-gl/mathgl/mgl32"
 )
 
 type vertex []float32
@@ -40,4 +42,8 @@ var vertices = vertex{
 
 var indices = []uint16{
 	0, 1, 2, 2, 3, 0,
+}
+
+type UniformBufferObject struct {
+	model, view, projection mgl32.Mat4
 }
