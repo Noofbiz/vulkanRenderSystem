@@ -7,9 +7,9 @@ import (
 	"time"
 	"unsafe"
 
-	"engo.io/ecs"
-	"engo.io/engo"
-	"engo.io/systems/physics"
+	"github.com/EngoEngine/ecs"
+	"github.com/EngoEngine/engo"
+	"github.com/EngoEngine/systems/physics"
 
 	"github.com/Noofbiz/vulkanRenderSystem/internal/shaders"
 	"github.com/go-gl/mathgl/mgl32"

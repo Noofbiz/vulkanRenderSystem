@@ -3,8 +3,8 @@
 package main
 
 import (
-	"engo.io/ecs"
-	"engo.io/engo"
+	"github.com/EngoEngine/ecs"
+	"github.com/EngoEngine/engo"
 
 	"github.com/Noofbiz/vulkanRenderSystem"
 )
@@ -17,8 +17,7 @@ type Guy struct {
 	ecs.BasicEntity
 }
 
-func (*DefaultScene) Preload() {
-}
+func (*DefaultScene) Preload() {}
 
 func (d *DefaultScene) Setup(u engo.Updater) {
 	w, _ := u.(*ecs.World)
