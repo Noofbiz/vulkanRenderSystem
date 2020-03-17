@@ -29,6 +29,7 @@ func (r *RenderSystem) Cleanup() {
 	vk.DestroySurface(r.instance, r.surface, nil)
 	vk.DestroyDevice(r.device, nil)
 	vk.DestroyInstance(r.instance, nil)
+	theRenderSystem = nil
 }
 
 func (r *RenderSystem) cleanupSwapChain() {

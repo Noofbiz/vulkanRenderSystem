@@ -1,6 +1,7 @@
 package vulkanRenderSystem
 
 import (
+	"os"
 	"unsafe"
 
 	vk "github.com/vulkan-go/vulkan"
@@ -77,4 +78,14 @@ type sliceHeader struct {
 	Data uintptr
 	Len  int
 	Cap  int
+}
+
+func getExt(path string) string {
+	ext := ""
+	for i := len(path) - 1; i >= 0 && !os.IsPathSeparator(path[i]); i-- {
+		if path[i] == '.' {
+			ext = path[i:]
+		}
+	}
+	return ext
 }

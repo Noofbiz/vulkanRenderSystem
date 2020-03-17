@@ -2,10 +2,15 @@ package vulkanRenderSystem
 
 import (
 	"errors"
+	"image"
 	"image/color"
+	"image/draw"
+	"os"
 	"sync"
 	"time"
 	"unsafe"
+
+	_ "image/jpeg"
 
 	"github.com/EngoEngine/ecs"
 	"github.com/EngoEngine/engo"
@@ -82,7 +87,11 @@ type RenderSystem struct {
 	startTime                time.Time
 	descriptorPool           vk.DescriptorPool
 	descriptorSets           []vk.DescriptorSet
+	textureImage             vk.Image
+	textureImageMemory       vk.DeviceMemory
 }
+
+var theRenderSystem *RenderSystem
 
 func (r *RenderSystem) New(w *ecs.World) {
 	engo.Mailbox.Listen("WindowResizeMessage", func(m engo.Message) {
@@ -118,6 +127,9 @@ func (r *RenderSystem) New(w *ecs.World) {
 	if err := r.createCommandPool(); err != nil {
 		panic(err)
 	}
+	if err := r.createTextureImage(); err != nil {
+		panic(err)
+	}
 	if err := r.createVertexBuffer(); err != nil {
 		panic(err)
 	}
@@ -138,6 +150,10 @@ func (r *RenderSystem) New(w *ecs.World) {
 	}
 	if err := r.createSyncObjects(); err != nil {
 		panic(err)
+	}
+	theRenderSystem = r
+	for k, v := range imagesToAdd {
+		theTextureLoader.Load(k, v)
 	}
 }
 
@@ -714,6 +730,97 @@ func (r *RenderSystem) createCommandPool() error {
 	return nil
 }
 
+func (r *RenderSystem) createTextureImage() error {
+	f, err := os.Open("assets/texture.jpg")
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	img, _, err := image.Decode(f)
+	if err != nil {
+		return err
+	}
+	bounds := img.Bounds()
+	nrgba := image.NewNRGBA(bounds)
+	draw.Draw(nrgba, bounds, img, image.ZP, draw.Src)
+	imgSize := vk.DeviceSize(4 * bounds.Dx() * bounds.Dy())
+
+	stagingBuffer, stagingBufferMemory, err := r.createBuffer(imgSize, vk.BufferUsageFlags(vk.BufferUsageTransferSrcBit), vk.MemoryPropertyFlags(vk.MemoryPropertyHostVisibleBit|vk.MemoryPropertyHostCoherentBit))
+	if err != nil {
+		return err
+	}
+
+	var data unsafe.Pointer
+	vk.MapMemory(r.device, stagingBufferMemory, 0, imgSize, 0, &data)
+	vk.Memcopy(data, []byte(nrgba.Pix))
+	vk.UnmapMemory(r.device, stagingBufferMemory)
+
+	err = r.createImage(uint32(bounds.Dx()), uint32(bounds.Dy()), vk.FormatR8g8b8a8Srgb, vk.ImageTilingOptimal, vk.ImageUsageFlags(vk.ImageUsageTransferDstBit|vk.ImageUsageSampledBit), vk.MemoryPropertyFlags(vk.MemoryPropertyDeviceLocalBit), r.textureImage, r.textureImageMemory)
+	if err != nil {
+		return err
+	}
+
+	err = r.transitionImageLayout(r.textureImage, vk.FormatR8g8b8a8Srgb, vk.ImageLayoutUndefined, vk.ImageLayoutTransferDstOptimal)
+	if err != nil {
+		return err
+	}
+	err = r.copyBufferToImage(stagingBuffer, r.textureImage, uint32(bounds.Dx()), uint32(bounds.Dy()))
+	if err != nil {
+		return err
+	}
+
+	return r.transitionImageLayout(r.textureImage, vk.FormatR8g8b8a8Srgb, vk.ImageLayoutTransferDstOptimal, vk.ImageLayoutShaderReadOnlyOptimal)
+}
+
+func (r *RenderSystem) createImage(width, height uint32, format vk.Format, tiling vk.ImageTiling, usage vk.ImageUsageFlags, properties vk.MemoryPropertyFlags, image vk.Image, imageMemory vk.DeviceMemory) error {
+	imageInfo := vk.ImageCreateInfo{
+		SType:     vk.StructureTypeImageCreateInfo,
+		ImageType: vk.ImageType2d,
+		Extent: vk.Extent3D{
+			Width:  width,
+			Height: height,
+			Depth:  1,
+		},
+		MipLevels:     1,
+		ArrayLayers:   1,
+		Format:        format,
+		Tiling:        tiling,
+		InitialLayout: vk.ImageLayoutUndefined,
+		Usage:         usage,
+		SharingMode:   vk.SharingModeExclusive,
+		Samples:       vk.SampleCount1Bit,
+	}
+
+	if vk.CreateImage(r.device, &imageInfo, nil, &image) != vk.Success {
+		return errors.New("unable to create image!")
+	}
+
+	var memRequirements vk.MemoryRequirements
+	vk.GetImageMemoryRequirements(r.device, image, &memRequirements)
+	memRequirements.Deref()
+
+	memtype, err := r.findMemoryType(memRequirements.MemoryTypeBits, properties)
+	if err != nil {
+		return err
+	}
+
+	allocInfo := vk.MemoryAllocateInfo{
+		SType:           vk.StructureTypeMemoryAllocateInfo,
+		AllocationSize:  memRequirements.Size,
+		MemoryTypeIndex: memtype,
+	}
+
+	if vk.AllocateMemory(r.device, &allocInfo, nil, &imageMemory) != vk.Success {
+		return errors.New("failed to allocate image memory!")
+	}
+
+	if vk.BindImageMemory(r.device, image, imageMemory, 0) != vk.Success {
+		return errors.New("failed to bind image memory")
+	}
+
+	return nil
+}
+
 func (r *RenderSystem) createCommandBuffers() error {
 	r.commandBuffers = make([]vk.CommandBuffer, len(r.swapChainFramebuffers))
 
@@ -907,24 +1014,9 @@ func (r *RenderSystem) createBuffer(size vk.DeviceSize, usage vk.BufferUsageFlag
 }
 
 func (r *RenderSystem) copyBuffer(src, dst vk.Buffer, size vk.DeviceSize) error {
-	allocInfo := vk.CommandBufferAllocateInfo{
-		SType:              vk.StructureTypeCommandBufferAllocateInfo,
-		Level:              vk.CommandBufferLevelPrimary,
-		CommandPool:        r.commandPool,
-		CommandBufferCount: 1,
-	}
-	var commandBuf vk.CommandBuffer
-	commandBufs := []vk.CommandBuffer{commandBuf}
-	if res := vk.AllocateCommandBuffers(r.device, &allocInfo, commandBufs); res != vk.Success {
-		return errors.New("unable to allocate command buffer at copy buffer")
-	}
-
-	beginInfo := vk.CommandBufferBeginInfo{
-		SType: vk.StructureTypeCommandBufferBeginInfo,
-		Flags: vk.CommandBufferUsageFlags(vk.CommandBufferUsageOneTimeSubmitBit),
-	}
-	if res := vk.BeginCommandBuffer(commandBufs[0], &beginInfo); res != vk.Success {
-		return errors.New("unable to begin command buffer at copy buffer")
+	commandBufs, err := r.beginSingleTimeCommands()
+	if err != nil {
+		return err
 	}
 
 	copyRegion := []vk.BufferCopy{vk.BufferCopy{
@@ -934,6 +1026,33 @@ func (r *RenderSystem) copyBuffer(src, dst vk.Buffer, size vk.DeviceSize) error 
 	}}
 	vk.CmdCopyBuffer(commandBufs[0], src, dst, 1, copyRegion)
 
+	return r.endSingleTimeCommands(commandBufs)
+}
+
+func (r *RenderSystem) beginSingleTimeCommands() ([]vk.CommandBuffer, error) {
+	allocInfo := vk.CommandBufferAllocateInfo{
+		SType:              vk.StructureTypeCommandBufferAllocateInfo,
+		Level:              vk.CommandBufferLevelPrimary,
+		CommandPool:        r.commandPool,
+		CommandBufferCount: 1,
+	}
+	var commandBuf vk.CommandBuffer
+	commandBufs := []vk.CommandBuffer{commandBuf}
+	if res := vk.AllocateCommandBuffers(r.device, &allocInfo, commandBufs); res != vk.Success {
+		return commandBufs, errors.New("unable to allocate command buffer at copy buffer")
+	}
+
+	beginInfo := vk.CommandBufferBeginInfo{
+		SType: vk.StructureTypeCommandBufferBeginInfo,
+		Flags: vk.CommandBufferUsageFlags(vk.CommandBufferUsageOneTimeSubmitBit),
+	}
+	if res := vk.BeginCommandBuffer(commandBufs[0], &beginInfo); res != vk.Success {
+		return commandBufs, errors.New("unable to begin command buffer at copy buffer")
+	}
+	return commandBufs, nil
+}
+
+func (r *RenderSystem) endSingleTimeCommands(commandBufs []vk.CommandBuffer) error {
 	if res := vk.EndCommandBuffer(commandBufs[0]); res != vk.Success {
 		return errors.New("unable to end command buffer")
 	}
@@ -952,6 +1071,68 @@ func (r *RenderSystem) copyBuffer(src, dst vk.Buffer, size vk.DeviceSize) error 
 	vk.FreeCommandBuffers(r.device, r.commandPool, 1, commandBufs)
 
 	return nil
+}
+
+func (r *RenderSystem) transitionImageLayout(image vk.Image, format vk.Format, oldLayout, newLayout vk.ImageLayout) error {
+	commandBuffers, err := r.beginSingleTimeCommands()
+	if err != nil {
+		return err
+	}
+
+	barrier := []vk.ImageMemoryBarrier{
+		vk.ImageMemoryBarrier{
+			SType:               vk.StructureTypeImageMemoryBarrier,
+			OldLayout:           oldLayout,
+			NewLayout:           newLayout,
+			SrcQueueFamilyIndex: vk.QueueFamilyIgnored,
+			DstQueueFamilyIndex: vk.QueueFamilyIgnored,
+			Image:               image,
+			SubresourceRange: vk.ImageSubresourceRange{
+				AspectMask:     vk.ImageAspectFlags(vk.ImageAspectColorBit),
+				BaseMipLevel:   0,
+				LevelCount:     1,
+				BaseArrayLayer: 0,
+				LayerCount:     1,
+			},
+			SrcAccessMask: vk.AccessFlags(0),
+			DstAccessMask: vk.AccessFlags(0),
+		},
+	}
+
+	vk.CmdPipelineBarrier(commandBuffers[0], 0, 0, 0, 0, nil, 0, nil, 0, barrier)
+
+	return r.endSingleTimeCommands(commandBuffers)
+}
+
+func (r *RenderSystem) copyBufferToImage(buffer vk.Buffer, image vk.Image, width, height uint32) error {
+	commandBuffers, err := r.beginSingleTimeCommands()
+	if err != nil {
+		return err
+	}
+
+	regions := []vk.BufferImageCopy{
+		vk.BufferImageCopy{
+			BufferOffset:      vk.DeviceSize(0),
+			BufferRowLength:   0,
+			BufferImageHeight: 0,
+			ImageSubresource: vk.ImageSubresourceLayers{
+				AspectMask:     vk.ImageAspectFlags(vk.ImageAspectColorBit),
+				MipLevel:       0,
+				BaseArrayLayer: 0,
+				LayerCount:     1,
+			},
+			ImageOffset: vk.Offset3D{X: 0, Y: 0, Z: 0},
+			ImageExtent: vk.Extent3D{
+				Width:  width,
+				Height: height,
+				Depth:  1,
+			},
+		},
+	}
+
+	//vk.CmdCopyBufferToImage(commandBuffers[0], buffer, image, vk.ImageLayoutTransferDstOptimal, 1, regions)
+
+	return r.endSingleTimeCommands(commandBuffers)
 }
 
 func (r *RenderSystem) createIndexBuffer() error {

@@ -17,7 +17,9 @@ type Guy struct {
 	ecs.BasicEntity
 }
 
-func (*DefaultScene) Preload() {}
+func (d *DefaultScene) Preload() {
+	engo.Files.Load("texture.jpg")
+}
 
 func (d *DefaultScene) Setup(u engo.Updater) {
 	w, _ := u.(*ecs.World)
