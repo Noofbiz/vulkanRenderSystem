@@ -89,6 +89,8 @@ type RenderSystem struct {
 	descriptorSets           []vk.DescriptorSet
 	textureImage             vk.Image
 	textureImageMemory       vk.DeviceMemory
+	textureImageView         vk.ImageView
+	textureSampler           vk.Sampler
 }
 
 var theRenderSystem *RenderSystem
@@ -128,6 +130,12 @@ func (r *RenderSystem) New(w *ecs.World) {
 		panic(err)
 	}
 	if err := r.createTextureImage(); err != nil {
+		panic(err)
+	}
+	if err := r.createTextureImageView(); err != nil {
+		panic(err)
+	}
+	if err := r.createTextureSampler(); err != nil {
 		panic(err)
 	}
 	if err := r.createVertexBuffer(); err != nil {
@@ -755,51 +763,35 @@ func (r *RenderSystem) createTextureImage() error {
 	vk.Memcopy(data, []byte(nrgba.Pix))
 	vk.UnmapMemory(r.device, stagingBufferMemory)
 
-	err = r.createImage(uint32(bounds.Dx()), uint32(bounds.Dy()), vk.FormatR8g8b8a8Srgb, vk.ImageTilingOptimal, vk.ImageUsageFlags(vk.ImageUsageTransferDstBit|vk.ImageUsageSampledBit), vk.MemoryPropertyFlags(vk.MemoryPropertyDeviceLocalBit), r.textureImage, r.textureImageMemory)
-	if err != nil {
-		return err
-	}
-
-	err = r.transitionImageLayout(r.textureImage, vk.FormatR8g8b8a8Srgb, vk.ImageLayoutUndefined, vk.ImageLayoutTransferDstOptimal)
-	if err != nil {
-		return err
-	}
-	err = r.copyBufferToImage(stagingBuffer, r.textureImage, uint32(bounds.Dx()), uint32(bounds.Dy()))
-	if err != nil {
-		return err
-	}
-
-	return r.transitionImageLayout(r.textureImage, vk.FormatR8g8b8a8Srgb, vk.ImageLayoutTransferDstOptimal, vk.ImageLayoutShaderReadOnlyOptimal)
-}
-
-func (r *RenderSystem) createImage(width, height uint32, format vk.Format, tiling vk.ImageTiling, usage vk.ImageUsageFlags, properties vk.MemoryPropertyFlags, image vk.Image, imageMemory vk.DeviceMemory) error {
 	imageInfo := vk.ImageCreateInfo{
 		SType:     vk.StructureTypeImageCreateInfo,
 		ImageType: vk.ImageType2d,
 		Extent: vk.Extent3D{
-			Width:  width,
-			Height: height,
+			Width:  uint32(bounds.Dx()),
+			Height: uint32(bounds.Dy()),
 			Depth:  1,
 		},
 		MipLevels:     1,
 		ArrayLayers:   1,
-		Format:        format,
-		Tiling:        tiling,
+		Format:        vk.FormatR8g8b8a8Srgb,
+		Tiling:        vk.ImageTilingOptimal,
 		InitialLayout: vk.ImageLayoutUndefined,
-		Usage:         usage,
+		Usage:         vk.ImageUsageFlags(vk.ImageUsageTransferDstBit | vk.ImageUsageSampledBit),
 		SharingMode:   vk.SharingModeExclusive,
 		Samples:       vk.SampleCount1Bit,
 	}
 
-	if vk.CreateImage(r.device, &imageInfo, nil, &image) != vk.Success {
+	texImg := r.textureImage
+	if vk.CreateImage(r.device, &imageInfo, nil, &texImg) != vk.Success {
 		return errors.New("unable to create image!")
 	}
+	r.textureImage = texImg
 
 	var memRequirements vk.MemoryRequirements
-	vk.GetImageMemoryRequirements(r.device, image, &memRequirements)
+	vk.GetImageMemoryRequirements(r.device, r.textureImage, &memRequirements)
 	memRequirements.Deref()
 
-	memtype, err := r.findMemoryType(memRequirements.MemoryTypeBits, properties)
+	memtype, err := r.findMemoryType(memRequirements.MemoryTypeBits, vk.MemoryPropertyFlags(vk.MemoryPropertyDeviceLocalBit))
 	if err != nil {
 		return err
 	}
@@ -810,13 +802,84 @@ func (r *RenderSystem) createImage(width, height uint32, format vk.Format, tilin
 		MemoryTypeIndex: memtype,
 	}
 
-	if vk.AllocateMemory(r.device, &allocInfo, nil, &imageMemory) != vk.Success {
+	texImMem := r.textureImageMemory
+	if vk.AllocateMemory(r.device, &allocInfo, nil, &texImMem) != vk.Success {
 		return errors.New("failed to allocate image memory!")
 	}
 
-	if vk.BindImageMemory(r.device, image, imageMemory, 0) != vk.Success {
+	if vk.BindImageMemory(r.device, r.textureImage, texImMem, 0) != vk.Success {
 		return errors.New("failed to bind image memory")
 	}
+	r.textureImageMemory = texImMem
+
+	err = r.transitionImageLayout(r.textureImage, vk.FormatR8g8b8a8Srgb, vk.ImageLayoutUndefined, vk.ImageLayoutTransferDstOptimal)
+	if err != nil {
+		return err
+	}
+	err = r.copyBufferToImage(stagingBuffer, r.textureImage, uint32(bounds.Dx()), uint32(bounds.Dy()))
+	if err != nil {
+		return err
+	}
+	err = r.transitionImageLayout(r.textureImage, vk.FormatR8g8b8a8Srgb, vk.ImageLayoutTransferDstOptimal, vk.ImageLayoutShaderReadOnlyOptimal)
+	if err != nil {
+		return err
+	}
+
+	vk.DestroyBuffer(r.device, stagingBuffer, nil)
+	vk.FreeMemory(r.device, stagingBufferMemory, nil)
+
+	return nil
+}
+
+func (r *RenderSystem) createTextureImageView() error {
+	viewInfo := vk.ImageViewCreateInfo{
+		SType:    vk.StructureTypeImageViewCreateInfo,
+		Image:    r.textureImage,
+		ViewType: vk.ImageViewType2d,
+		Format:   vk.FormatR8g8b8a8Srgb,
+		SubresourceRange: vk.ImageSubresourceRange{
+			AspectMask:     vk.ImageAspectFlags(vk.ImageAspectColorBit),
+			BaseMipLevel:   0,
+			LevelCount:     1,
+			BaseArrayLayer: 0,
+			LayerCount:     1,
+		},
+	}
+
+	view := r.textureImageView
+	if ok := vk.CreateImageView(r.device, &viewInfo, nil, &view); ok != vk.Success {
+		return errors.New("failed to create texture image view!")
+	}
+	r.textureImageView = view
+
+	return nil
+}
+
+func (r *RenderSystem) createTextureSampler() error {
+	samplerInfo := vk.SamplerCreateInfo{
+		SType:                   vk.StructureTypeSamplerCreateInfo,
+		MagFilter:               vk.FilterLinear,
+		MinFilter:               vk.FilterLinear,
+		AddressModeU:            vk.SamplerAddressModeRepeat,
+		AddressModeV:            vk.SamplerAddressModeRepeat,
+		AddressModeW:            vk.SamplerAddressModeRepeat,
+		AnisotropyEnable:        vk.Bool32(vk.True),
+		MaxAnisotropy:           16,
+		BorderColor:             vk.BorderColorIntOpaqueBlack,
+		UnnormalizedCoordinates: vk.Bool32(vk.False),
+		CompareEnable:           vk.Bool32(vk.False),
+		CompareOp:               vk.CompareOpAlways,
+		MipmapMode:              vk.SamplerMipmapModeLinear,
+		MipLodBias:              0,
+		MinLod:                  0,
+		MaxLod:                  0,
+	}
+
+	sampler := r.textureSampler
+	if ok := vk.CreateSampler(r.device, &samplerInfo, nil, &sampler); ok != vk.Success {
+		return errors.New("failed to create texture sampler!")
+	}
+	r.textureSampler = sampler
 
 	return nil
 }
@@ -1130,7 +1193,7 @@ func (r *RenderSystem) copyBufferToImage(buffer vk.Buffer, image vk.Image, width
 		},
 	}
 
-	//vk.CmdCopyBufferToImage(commandBuffers[0], buffer, image, vk.ImageLayoutTransferDstOptimal, 1, regions)
+	vk.CmdCopyBufferToImage(commandBuffers[0], buffer, image, vk.ImageLayoutTransferDstOptimal, 1, regions)
 
 	return r.endSingleTimeCommands(commandBuffers)
 }
@@ -1172,11 +1235,17 @@ func (r *RenderSystem) createDescriptorSetLayout() error {
 		StageFlags:         vk.ShaderStageFlags(vk.ShaderStageVertexBit),
 		PImmutableSamplers: []vk.Sampler{vk.NullSampler},
 	}
-	bindings := []vk.DescriptorSetLayoutBinding{uboLayoutBinding}
+	samplerLayoutBinding := vk.DescriptorSetLayoutBinding{
+		Binding:         1,
+		DescriptorCount: 1,
+		DescriptorType:  vk.DescriptorTypeCombinedImageSampler,
+		StageFlags:      vk.ShaderStageFlags(vk.ShaderStageFragmentBit),
+	}
+	bindings := []vk.DescriptorSetLayoutBinding{uboLayoutBinding, samplerLayoutBinding}
 
 	layoutInfo := vk.DescriptorSetLayoutCreateInfo{
 		SType:        vk.StructureTypeDescriptorSetLayoutCreateInfo,
-		BindingCount: 1,
+		BindingCount: uint32(len(bindings)),
 		PBindings:    bindings,
 	}
 
@@ -1238,10 +1307,14 @@ func (r *RenderSystem) createDescriptorPool() error {
 		Type:            vk.DescriptorTypeUniformBuffer,
 		DescriptorCount: uint32(len(r.images)),
 	}
-	poolSizes := []vk.DescriptorPoolSize{poolSize}
+	imgSamplerSize := vk.DescriptorPoolSize{
+		Type:            vk.DescriptorTypeCombinedImageSampler,
+		DescriptorCount: uint32(len(r.images)),
+	}
+	poolSizes := []vk.DescriptorPoolSize{poolSize, imgSamplerSize}
 	poolInfo := vk.DescriptorPoolCreateInfo{
 		SType:         vk.StructureTypeDescriptorPoolCreateInfo,
-		PoolSizeCount: 1,
+		PoolSizeCount: uint32(len(poolSizes)),
 		PPoolSizes:    poolSizes,
 		MaxSets:       uint32(len(r.images)),
 	}
@@ -1269,7 +1342,12 @@ func (r *RenderSystem) createDescriptorSets() error {
 		bufferInfo := vk.DescriptorBufferInfo{
 			Buffer: r.uniformBuffers[i],
 			Offset: 0,
-			Range:  vk.DeviceSize(vk.WholeSize),
+			Range:  vk.DeviceSize(int(unsafe.Sizeof(UniformBufferObject{}))),
+		}
+		imageInfo := vk.DescriptorImageInfo{
+			ImageLayout: vk.ImageLayoutShaderReadOnlyOptimal,
+			ImageView:   r.textureImageView,
+			Sampler:     r.textureSampler,
 		}
 		descriptorWrite := vk.WriteDescriptorSet{
 			SType:           vk.StructureTypeWriteDescriptorSet,
@@ -1280,7 +1358,17 @@ func (r *RenderSystem) createDescriptorSets() error {
 			DescriptorCount: 1,
 			PBufferInfo:     []vk.DescriptorBufferInfo{bufferInfo},
 		}
-		vk.UpdateDescriptorSets(r.device, 1, []vk.WriteDescriptorSet{descriptorWrite}, 0, nil)
+		imgSamplerWrite := vk.WriteDescriptorSet{
+			SType:           vk.StructureTypeWriteDescriptorSet,
+			DstSet:          r.descriptorSets[i],
+			DstBinding:      1,
+			DstArrayElement: 0,
+			DescriptorType:  vk.DescriptorTypeCombinedImageSampler,
+			DescriptorCount: 1,
+			PImageInfo:      []vk.DescriptorImageInfo{imageInfo},
+		}
+		writeDescriptorSets := []vk.WriteDescriptorSet{descriptorWrite, imgSamplerWrite}
+		vk.UpdateDescriptorSets(r.device, uint32(len(writeDescriptorSets)), writeDescriptorSets, 0, nil)
 	}
 	return nil
 }

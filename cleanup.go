@@ -8,6 +8,10 @@ import (
 func (r *RenderSystem) Cleanup() {
 	vk.DeviceWaitIdle(r.device)
 	r.cleanupSwapChain()
+	vk.DestroySampler(r.device, r.textureSampler, nil)
+	vk.DestroyImageView(r.device, r.textureImageView, nil)
+	vk.DestroyImage(r.device, r.textureImage, nil)
+	vk.FreeMemory(r.device, r.textureImageMemory, nil)
 	vk.DestroyDescriptorPool(r.device, r.descriptorPool, nil)
 	for i := 0; i < len(r.descriptorSetLayouts); i++ {
 		vk.DestroyDescriptorSetLayout(r.device, r.descriptorSetLayouts[i], nil)
